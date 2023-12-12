@@ -14,20 +14,20 @@
 
 """Transforms tests."""
 
-import operator
-import unittest
 from functools import partial
+import operator
 from typing import Any, Callable, Sequence
+import unittest
 
-import jax
-import jax.numpy as jnp
-import numpy as np
 from absl.testing import absltest
-from jax import random
-
 from flax import errors
 from flax import linen as nn
 from flax.core import copy, freeze
+from flax.linen.transforms import _HashableProxy
+import jax
+from jax import random
+import jax.numpy as jnp
+import numpy as np
 
 # Parse absl flags test_srcdir and test_tmpdir.
 jax.config.parse_flags_with_absl()
@@ -1742,6 +1742,128 @@ class TransformTest(absltest.TestCase):
 
     self.assertEqual(s, 'hi')
     np.testing.assert_array_equal(y, jnp.array(1.0))
+
+  def test_jit_repr_hash(self):
+    n = 0
+
+    @partial(jax.jit, static_argnums=0)
+    def f(obj):
+      nonlocal n
+      n += 1
+      return None
+
+    f(_ReprHash(nn.Dense(10)))
+    self.assertEqual(n, 1)
+    f(_ReprHash(nn.Dense(10)))
+    self.assertEqual(n, 1)
+
+    f(_ReprHash(nn.Dense(20)))
+    self.assertEqual(n, 2)
+    f(_ReprHash(nn.Dense(20)))
+    self.assertEqual(n, 2)
+
+  def test_jit_reuse(self):
+    n = 0
+
+    class Foo(nn.Module):
+
+      @nn.jit
+      def __call__(self, x):
+        nonlocal n
+        n += 1
+        return x
+
+    x = jnp.array(1.0)
+    m = Foo()
+
+    self.assertEqual(n, 0)
+
+    y = m.apply({}, x)
+    self.assertEqual(n, 1)
+    y = m .apply({}, x)
+    self.assertEqual(n, 1)
+
+  def test_jit_reuse_hash(self):
+    n = 0
+
+    class Foo(nn.Module):
+      key: int
+
+      @nn.jit
+      def __call__(self, x):
+        nonlocal n
+        n += 1
+        return x
+
+    x = jnp.array(1.0)
+    self.assertEqual(n, 0)
+
+    y = Foo(1).apply({}, x)
+    self.assertEqual(n, 1)
+    y = Foo(1).apply({}, x)
+    self.assertEqual(n, 1)
+    y = Foo(2).apply({}, x)
+    self.assertEqual(n, 2)
+    y = Foo(2).apply({}, x)
+    self.assertEqual(n, 2)
+
+  def test_jit_reuse_hash_class(self):
+    n = 0
+
+    @nn.jit
+    class Foo(nn.Module):
+      key: int
+
+      def __call__(self, x):
+        nonlocal n
+        n += 1
+        return x
+
+    x = jnp.array(1.0)
+    self.assertEqual(n, 0)
+
+    y = Foo(1).apply({}, x)
+    self.assertEqual(n, 1)
+    y = Foo(1).apply({}, x)
+    self.assertEqual(n, 1)
+    y = Foo(2).apply({}, x)
+    self.assertEqual(n, 2)
+    y = Foo(2).apply({}, x)
+    self.assertEqual(n, 2)
+
+  def test_jit_reuse_submodules(self):
+    test = self
+    n = 0
+    key = None
+    name = None
+
+    class Foo(nn.Module):
+      key: int
+
+      @nn.jit
+      def __call__(self, x):
+        nonlocal n, key, name
+        n += 1
+        key = self.key
+        name = self.name
+        return x
+
+    class Parent(nn.Module):
+
+      @nn.compact
+      def __call__(self, x):
+
+        for i in range(3):
+          m = Foo(i)
+          y = m(x)
+          test.assertEqual(key, i)
+          test.assertEqual(name, f'Foo_{i}')
+          test.assertEqual(n, i + 1)
+
+    x = jnp.array(1.0)
+    self.assertEqual(n, 0)
+
+    y = Parent().apply({}, x)
 
   def test_while_loop(self):
     class Foo(nn.Module):

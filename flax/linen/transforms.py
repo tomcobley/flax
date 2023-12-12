@@ -42,6 +42,7 @@ from typing import (
 from flax import errors, struct, traceback_util
 from flax.core import Scope, lift, meta
 from flax.core.frozen_dict import FrozenDict
+from flax.ids import FlaxId
 from flax.linen import module as linen_module
 from flax.linen.module import (
   Module,
@@ -51,6 +52,7 @@ from flax.linen.module import (
   wrap_method_once,
 )
 import jax
+import numpy as np
 
 traceback_util.register_exclusion(__file__)
 
@@ -426,6 +428,241 @@ def decorator_lift_transform(
   return wrapped_fn
 
 
+@dataclasses.dataclass(frozen=True)
+class _HashableProxy:
+  """A hashable proxy object that is use to define a hash for Modules.
+
+  The hash produced by _HashableProxy is useful for nn.jit to decide if a
+  function should be retraced or not
+  """
+
+  obj: Any
+
+  def __hash__(self):
+    key = _hashable_repr(self.obj)
+    return hash(key)
+
+  def __eq__(self, other):
+    return isinstance(other, _HashableProxy) and _hashable_repr(
+        self.obj
+    ) == _hashable_repr(other.obj)
+
+
+def _hashable_repr(x: Any) -> tuple[type[Any], Any]:
+  module_seen = {}
+  return _hashable_repr_recursive(x, module_seen)
+
+def _hashable_repr_recursive(
+    x: Any, module_seen: dict[FlaxId, int]
+) :
+  """Creates a hashable representation for a Module by travering its structure recursively."""
+  if isinstance(x, str):
+    # Here we test for string early as they are also Sequences.
+    static = x
+  elif isinstance(x, (jax.Array, np.ndarray)):
+    raise ValueError(f"type '{type(x)}' is not hashable.")
+  elif isinstance(x, Module):
+    if x._id in module_seen:
+      # if we have already seen the module we just use the index
+      # as its static component
+      static = module_seen[x._id]
+    else:
+      # if its a new module we add it to the cache and give it
+      # a new index
+      module_seen[x._id] = len(module_seen)
+      # TODO(cgarciae): define a way for the user of nn.jit to define
+      # what fields it wants to ignore per Module instance.
+      static = tuple(
+          (
+              field.name,
+              _hashable_repr_recursive(getattr(x, field.name), module_seen),
+          )
+          for field in dataclasses.fields(x)
+          if hasattr(x, field.name) and field.name not in ('parent', 'name')
+      )
+  elif isinstance(x, Mapping):
+    static = tuple(
+        (name, _hashable_repr_recursive(value, module_seen))
+        for name, value in sorted(x.items())
+    )
+  elif isinstance(x, Sequence):
+    static = tuple(_hashable_repr_recursive(value, module_seen) for value in x)
+  else:
+    # test for hashability to catch errors early
+    try:
+      hash(x)
+    except Exception:
+      raise ValueError(f"type '{type(x)}' is not hashable.")
+
+    static = x
+
+  return type(x), static
+
+
+def decorator_lift_transform_jit(class_fn, **trafo_kwargs):
+  """Decorator for lifted transform.
+
+  Similar to `decorator_lift_transform` but specialized for `jit`, it reuses the
+  previous transform when available to avoid retracing.
+  """
+  # TODO(marcvanzee): Improve docstrings (#1977).
+  # Due to the ordering of method decorators, we must wrap the class_fn
+  # with the module state management wrapper first to maintain Module state
+  # correctly.
+  transform = lift.jit
+  multi_scope = True
+
+  if isinstance(class_fn, tuple):
+    class_fns = class_fn
+  else:
+    class_fns = (class_fn,)
+  prewrapped_fns = [wrap_method_once(class_fn) for class_fn in class_fns]
+  trafo_fn = None
+
+  @functools.wraps(prewrapped_fns[0])
+  def wrapped_fn(self, *args, **kwargs):
+    nonlocal trafo_fn
+    state = self._state.export()
+
+    # make a scope-function to transform
+    def core_fn(
+        prewrapped_fn,
+        class_fn,
+        scopes,
+        hash_key: _HashableProxy,
+        *args,
+        **kwargs,
+    ):
+      self = hash_key.obj
+      if not multi_scope:
+        scopes = [scopes]
+      cloned, args, kwargs = set_module_scopes(self, args, kwargs, scopes)
+      object.__setattr__(cloned, '_state', state.export())
+      res = prewrapped_fn(cloned, *args, **kwargs)
+      self._state.reimport(cloned._state)
+      _test_transformed_return_values(res, getattr(class_fn, '__name__', None))
+      return res
+
+    core_fns = [
+        functools.partial(core_fn, prewrapped_fn, class_fn)
+        for prewrapped_fn, class_fn in zip(prewrapped_fns, class_fns)
+    ]
+
+    # here we apply the given lifting transform to the scope-ingesting fn
+    if trafo_fn is None:
+      trafo_fn = transform(*core_fns, **trafo_kwargs)
+
+    module_scopes, args, kwargs = get_module_scopes(self, args, kwargs)
+    if not multi_scope:
+      if len(module_scopes) != 1:
+        # TODO(levskaya): transforms like jvp & vjp have args that follow the
+        # pytree structure of scopes. The user doesn't explicitly control shared
+        # modules passed as arguments to methods or as attributes to Module
+        # constructors. Therefore, there is no obvious API for specifying
+        # arguments per lifted Module.
+        raise NotImplementedError(
+            'This transform does not yet support'
+            ' Modules that include other Modules passed as arguments.'
+        )
+      module_scopes = module_scopes[0]
+
+    # get a hash for the Module by using its repr as a proxy
+    hash_key = _HashableProxy(self)
+
+    return trafo_fn(module_scopes, hash_key, *args, **kwargs)
+
+  return wrapped_fn
+
+def module_class_lift_transform_jit(module_class, methods=None, **trafo_kwargs):
+  """Module class lift transform."""
+  # TODO(marcvanzee): Improve docstrings (#1977).
+  # TODO(levskaya): find nicer argument convention for multi-method case?
+  transform = lift.jit
+  trafo_args = ()
+
+  # Prepare per-method transform args, kwargs.
+  if methods is None:
+    # Default case, just transform __call__
+    class_trafo_args = {'__call__': (trafo_args, trafo_kwargs)}
+  elif isinstance(methods, (list, tuple)):
+    # Transform every method in methods with given args, kwargs.
+    class_trafo_args = {m: (trafo_args, trafo_kwargs) for m in methods}
+  elif isinstance(methods, dict):
+    # Pass different trafo args per each method.
+    class_trafo_args = {k: ((), v) for k, v in methods.items()}
+  else:
+    raise ValueError(
+        'transform methods argument must be None, tuple, list, or dict.'
+    )
+
+  # Handle partially initialized module class constructors.
+  if isinstance(module_class, functools.partial) and issubclass(
+      module_class.func, Module
+  ):
+    partial_object = module_class
+    module_class = module_class.func
+  else:
+    partial_object = None
+
+  def create_trans_fn(fn_name, fn_trafo_args):
+    # get existing unbound method from class
+    fn = getattr(module_class, fn_name)
+    trafo_args, trafo_kwargs = fn_trafo_args
+    trafo_fn = None
+
+    # we need to create a scope-function from our class for the given method
+    @functools.wraps(fn)
+    def wrapped_fn(self, *args, **kwargs):
+      nonlocal trafo_fn
+      state = self._state.export()
+
+      # make a scope-function to transform
+      def core_fn(scopes, hash_key: _HashableProxy, *args, **kwargs):
+        self = hash_key.obj
+        # make a clone of self using its arguments
+        attrs = {
+            f.name: getattr(self, f.name)
+            for f in dataclasses.fields(self)
+            if f.name != 'parent' and f.init
+        }
+        # we reference module_class, not self.__class__ to avoid infinite loop
+        cloned = module_class(parent=None, **attrs)
+        cloned, args, kwargs = set_module_scopes(cloned, args, kwargs, scopes)
+        object.__setattr__(cloned, '_state', state.export())
+        res = fn(cloned, *args, **kwargs)
+        self._state.reimport(cloned._state)
+        _test_transformed_return_values(res, fn_name)
+        return res
+
+      # here we apply the given lifting transform to the scope-ingesting fn
+      trafo_fn = trafo_fn or transform(core_fn, *trafo_args, **trafo_kwargs)
+      module_scopes, args, kwargs = get_module_scopes(self, args, kwargs)
+
+      # get a hash for the Module by using its repr as a proxy
+      hash_key = _HashableProxy(self)
+
+      ret = trafo_fn(module_scopes, hash_key, *args, **kwargs)
+      return ret
+
+    return wrapped_fn
+
+  transformed_fns = {
+      fn_name: create_trans_fn(fn_name, fn_trafo_args)
+      for fn_name, fn_trafo_args in class_trafo_args.items()
+  }
+  # construct new dynamic class w. transformed methods
+  transformed_cls = type(
+      transform.__name__.capitalize() + module_class.__name__,
+      (module_class,),
+      transformed_fns,
+  )
+  # Handle partially initialized module class constructors.
+  if partial_object is not None:
+    transformed_cls = functools.partial(
+        transformed_cls, *partial_object.args, **partial_object.keywords
+    )
+  return transformed_cls
+
 # Utility to wrap a class or to use as decorator in def of class method.
 # -----------------------------------------------------------------------------
 
@@ -633,18 +870,33 @@ def jit(
   Returns:
     A wrapped version of target, set up for just-in-time compilation.
   """
-  return lift_transform(
-      lift.jit,
-      target,
-      variables=variables,
-      rngs=rngs,
-      static_argnums=static_argnums,
-      static_argnames=static_argnames,
-      donate_argnums=donate_argnums,
-      device=device,
-      backend=backend,
-      methods=methods,
-  )
+  # TODO(marcvanzee): Improve docstrings (#1977).
+  if _is_module_class(target):
+    return module_class_lift_transform_jit(
+        target,
+        variables=variables,
+        rngs=rngs,
+        static_argnums=static_argnums,
+        static_argnames=static_argnames,
+        donate_argnums=donate_argnums,
+        device=device,
+        backend=backend,
+        methods=methods,
+    )
+  # we presume this is being used as a function decorator in class definition
+  elif callable(target) and not isinstance(target, Module):
+    return decorator_lift_transform_jit(
+        target,
+        variables=variables,
+        rngs=rngs,
+        static_argnums=static_argnums,
+        static_argnames=static_argnames,
+        donate_argnums=donate_argnums,
+        device=device,
+        backend=backend,
+    )
+  else:
+    raise errors.TransformTargetError(target)
 
 
 def checkpoint(
